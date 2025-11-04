@@ -90,7 +90,7 @@ def run_vllm(
     download_dir: Optional[str] = None,
     load_format: str = EngineArgs.load_format,
     disable_async_output_proc: bool = False,
-) -> float:
+) -> Tuple[float, dict]:
     from vllm import LLM, SamplingParams
     llm = LLM(
         model=model,
@@ -135,7 +135,40 @@ def run_vllm(
     start = time.perf_counter()
     llm.generate(prompts, sampling_params, use_tqdm=True)
     end = time.perf_counter()
-    return end - start
+    elapsed_time = end - start
+    
+    # Collect KV cache block statistics
+    kv_cache_stats = {}
+    try:
+        # Access the engine core and scheduler to get KV block information
+        engine_core = llm.llm_engine.engine_core
+        if hasattr(engine_core, 'engine_core'):
+            # For multiprocess mode
+            engine_core = engine_core.engine_core
+        
+        if hasattr(engine_core, 'scheduler'):
+            scheduler = engine_core.scheduler
+            if hasattr(scheduler, 'kv_cache_manager') and hasattr(scheduler.kv_cache_manager, 'block_pool'):
+                block_pool = scheduler.kv_cache_manager.block_pool
+                num_total_blocks = block_pool.num_gpu_blocks
+                num_free_blocks = block_pool.get_num_free_blocks()
+                num_used_blocks = num_total_blocks - num_free_blocks
+                
+                # Calculate usage percentage (exclude null block)
+                usable_blocks = num_total_blocks - 1  # Subtract null block
+                usage_percentage = (num_used_blocks - 1) / usable_blocks * 100 if usable_blocks > 0 else 0
+                
+                kv_cache_stats = {
+                    "total_gpu_blocks": num_total_blocks,
+                    "used_gpu_blocks": num_used_blocks,
+                    "free_gpu_blocks": num_free_blocks,
+                    "kv_cache_usage_percentage": round(usage_percentage, 2),
+                }
+    except Exception as e:
+        # If we can't get KV cache stats, log the error but continue
+        print(f"Warning: Could not collect KV cache statistics: {e}")
+    
+    return elapsed_time, kv_cache_stats
 
 
 async def run_vllm_async(
@@ -319,6 +352,7 @@ def main(args: argparse.Namespace):
         requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
                                    args.output_len)
 
+    kv_cache_stats = {}
     if args.backend == "vllm":
         run_args = [
             requests, args.model, args.tokenizer, args.quantization,
@@ -337,7 +371,7 @@ def main(args: argparse.Namespace):
             run_args.append(args.disable_frontend_multiprocessing)
             elapsed_time = uvloop.run(run_vllm_async(*run_args))
         else:
-            elapsed_time = run_vllm(*run_args)
+            elapsed_time, kv_cache_stats = run_vllm(*run_args)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -352,6 +386,14 @@ def main(args: argparse.Namespace):
                            for _, prompt_len, output_len in requests)
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
           f"{total_num_tokens / elapsed_time:.2f} tokens/s")
+    
+    # Print KV cache statistics if available
+    if kv_cache_stats:
+        print("\nKV Cache Statistics:")
+        print(f"  Total GPU Blocks: {kv_cache_stats.get('total_gpu_blocks', 'N/A')}")
+        print(f"  Used GPU Blocks: {kv_cache_stats.get('used_gpu_blocks', 'N/A')}")
+        print(f"  Free GPU Blocks: {kv_cache_stats.get('free_gpu_blocks', 'N/A')}")
+        print(f"  KV Cache Usage: {kv_cache_stats.get('kv_cache_usage_percentage', 'N/A')}%")
 
     # Output JSON results if specified
     if args.output_json:
@@ -362,6 +404,9 @@ def main(args: argparse.Namespace):
             "requests_per_second": len(requests) / elapsed_time,
             "tokens_per_second": total_num_tokens / elapsed_time,
         }
+        # Add KV cache statistics if available
+        if kv_cache_stats:
+            results["kv_cache_stats"] = kv_cache_stats
         with open(args.output_json, "w") as f:
             json.dump(results, f, indent=4)
 

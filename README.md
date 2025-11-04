@@ -17,10 +17,10 @@ pip install vllm
 vllm serve /share-data/wzk-1/model/Qwen3-8B \
     --host 0.0.0.0 \
     --port 8000 \
-    --tensor-parallel-size 2 \
+    --tensor-parallel-size 4 \
     --gpu-memory-utilization 0.9 \
-    --max-model-len 8192 \
-    --max-num-batched-tokens 16384 \
+    --max-model-len 4096 \
+    --max-num-batched-tokens 163840 \
     --max-num-seqs 128
 ```
 

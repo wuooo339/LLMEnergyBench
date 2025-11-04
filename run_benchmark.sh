@@ -9,13 +9,13 @@ HOST="localhost"
 PORT="8000"
 BACKEND="vllm"
 DATASET_NAME="sharegpt"  # Using ShareGPT dataset
-NUM_PROMPTS=100        # Number of prompts to test
-REQUEST_RATE=50        # 10 requests per second
-OUTPUT_LEN=512        # max output length
+NUM_PROMPTS=1000        # Number of prompts to test
+REQUEST_RATE=5        # 10 requests per second
+OUTPUT_LEN=256        # max output length
 RESULT_DIR="/home/user/offload/FUEL/benchmark_results"
 # GPU monitoring settings
-GPU_IDS="0 1"          # Monitor both GPUs (adjust based on your setup)
-GPU_MONITOR_INTERVAL=0.1  # Monitor interval in seconds
+GPU_IDS="0 1 2 3"          # Monitor GPUs (adjust based on your setup)
+GPU_MONITOR_INTERVAL=0.05  # Monitor interval in seconds
 WARMUP_RATIO=0.1       # Ignore first 10% of requests for power stats
 DATASET_PATH="/share-data/wzk-1/dataset/ShareGPT_V3_unfiltered_cleaned_split.json"
 
@@ -40,6 +40,7 @@ python benchmark_serving.py \
     --gpu-monitor-interval $GPU_MONITOR_INTERVAL \
     --warmup-ratio $WARMUP_RATIO \
     --monitor-cpu \
+    --enable-kv-trace \
     --seed 42 \
     --trust-remote-code 
 
