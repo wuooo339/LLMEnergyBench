@@ -33,7 +33,7 @@ vllm serve /path/to/model
 #!/bin/bash
 
 # 配置
-MODEL="/share-data/wzk-1/model/Qwen3-8B"
+MODEL="/share-data/wzk-1/model/deepseek-v2-lite"
 BLOCK_SIZE=32  # 可选: 1, 8, 16, 32, 64, 128, 256
 GPU_MEMORY_UTIL=0.9
 
@@ -95,7 +95,7 @@ cd /home/user/offload/FUEL/benchmarks
 
 python benchmark_serving.py \
     --backend vllm \
-    --model /share-data/wzk-1/model/Qwen3-8B \
+    --model /share-data/wzk-1/model/deepseek-v2-lite \
     --host localhost \
     --port 8000 \
     --dataset-name sharegpt \

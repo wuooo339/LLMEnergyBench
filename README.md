@@ -14,7 +14,7 @@ pip install vllm
 #### 第 1 步：启动 vLLM 服务器
 
 ```bash
-vllm serve /share-data/wzk-1/model/Qwen3-8B \
+vllm serve /share-data/wzk-1/model/deepseek-v2-lite \
     --host 0.0.0.0 \
     --port 8000 \
     --tensor-parallel-size 4 \
@@ -54,7 +54,7 @@ cd /home/user/offload/FUEL
 # 服务器配置
 HOST="localhost"
 PORT=8000
-MODEL="/share-data/wzk-1/model/Qwen3-8B"
+MODEL="/share-data/wzk-1/model/deepseek-v2-lite"
 
 # 测试参数
 NUM_PROMPTS=100          # 请求数量
@@ -174,7 +174,7 @@ benchmark_results/
 {
   "date": "20251027-194328",
   "backend": "vllm",
-  "model_id": "/share-data/wzk-1/model/Qwen3-8B",
+  "model_id": "/share-data/wzk-1/model/deepseek-v2-lite",
   "request_rate": 10,
   "num_prompts": 100,
   

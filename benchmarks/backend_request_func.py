@@ -286,6 +286,7 @@ async def async_request_openai_completions(
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+        output.prompt = request_func_input.prompt  # 记录 prompt
 
         # The async method does not provide insight into scheduling details, e.g., arrival times, first scheduled time, etc.
         # Only the client-side time is recorded. However, we may still record the request send time, ignoring the transmission delay and treating it as the arrival time. We can also record the completion time, and using completion time - latency, we can approximate the first scheduled time.
@@ -317,6 +318,14 @@ async def async_request_openai_completions(
                             if token_count == 0:
                                 server_req_id = data.get("id", "unknown")[-8:]
 
+                            # 提取 cumulative_logprob（如果有的话）
+                            if "logprobs" in data["choices"][0] and data["choices"][0]["logprobs"]:
+                                token_logprobs = data["choices"][0]["logprobs"].get("token_logprobs", [])
+                                if token_logprobs and token_logprobs[-1] is not None:
+                                    if output.cumulative_logprob is None:
+                                        output.cumulative_logprob = 0.0
+                                    output.cumulative_logprob += token_logprobs[-1]
+
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
@@ -347,6 +356,12 @@ async def async_request_openai_completions(
                     output.completion_time = time.time()  # Use time.time() for absolute time
                     output.arrival_time = time.time() - latency  # Approximate arrival time
                     output.first_scheduled_time = time.time() - latency  # Approximate for OpenAI API
+                    output.first_token_time = output.arrival_time + ttft if ttft > 0 else None
+                    # 计算队列等待时间
+                    if output.first_token_time and output.arrival_time:
+                        output.time_in_queue = output.first_token_time - output.arrival_time
+                    else:
+                        output.time_in_queue = None
                 else:
                     output.error = response.reason or ""
                     output.success = False

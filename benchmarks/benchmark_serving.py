@@ -244,6 +244,7 @@ def sample_sharegpt_requests(
     tokenizer: PreTrainedTokenizerBase,
     fixed_input_len: Optional[int] = None,
     fixed_output_len: Optional[int] = None,
+    min_prompt_len: Optional[int] = None,
 ) -> List[Tuple[str, int, int, None]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -303,6 +304,10 @@ def sample_sharegpt_requests(
         # output_len = 5000  # Commented out to allow --sharegpt-output-len to work
         if len(real_prompt_token_ids) < 10 or output_len < 4:
             # Prune too short sequences.
+            continue
+        
+        # 筛选最小prompt长度（如果指定）
+        if min_prompt_len is not None and prompt_len < min_prompt_len:
             continue
         if prompt_len > 10000:
             # Prune too long sequences.
@@ -1527,6 +1532,7 @@ def main(args: argparse.Namespace):
             tokenizer=tokenizer,
             fixed_input_len=args.sharegpt_input_len,
             fixed_output_len=args.sharegpt_output_len,
+            min_prompt_len=args.min_prompt_len,
         )
 
     elif args.dataset_name == "sharegpt":
@@ -1536,6 +1542,7 @@ def main(args: argparse.Namespace):
             tokenizer=tokenizer,
             fixed_input_len=args.sharegpt_input_len,
             fixed_output_len=args.sharegpt_output_len,
+            min_prompt_len=args.min_prompt_len,
         )
 
     elif args.dataset_name == "arenahard":
@@ -2001,6 +2008,12 @@ if __name__ == "__main__":
         default=None,
         help="Output length for each request. Overrides the output length "
         "from the ShareGPT dataset.")
+    sharegpt_group.add_argument(
+        "--min-prompt-len",
+        type=int,
+        default=None,
+        help="最小 prompt 长度（tokens）。只有 prompt 长度大于等于此值的请求才会被发送。"
+        "用于筛选长请求进行测试。")
     
     arenahard_group = parser.add_argument_group("arenahard dataset options")
     arenahard_group.add_argument(
