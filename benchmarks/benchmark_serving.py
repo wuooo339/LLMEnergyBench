@@ -245,6 +245,7 @@ def sample_sharegpt_requests(
     fixed_input_len: Optional[int] = None,
     fixed_output_len: Optional[int] = None,
     min_prompt_len: Optional[int] = None,
+    server_max_model_len: Optional[int] = None,
 ) -> List[Tuple[str, int, int, None]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -300,7 +301,22 @@ def sample_sharegpt_requests(
         prompt_len = len(prompt_token_ids)
         output_len = len(completion_token_ids
                          ) if fixed_output_len is None else fixed_output_len
-        
+
+        # Clamp output_len to avoid exceeding model context length
+        # Use server-provided max_model_len if available, otherwise fall back to tokenizer
+        if server_max_model_len is not None:
+            max_model_len = server_max_model_len
+        else:
+            max_model_len = getattr(tokenizer, 'model_max_length', 4096)
+            if max_model_len is None or max_model_len > 100000:
+                max_model_len = 4096
+
+        # Ensure prompt_len + output_len doesn't exceed max_model_len
+        # Leave some headroom (50 tokens) for special tokens
+        max_output_len = max_model_len - prompt_len - 50
+        if output_len > max_output_len:
+            output_len = max(4, max_output_len)
+
         # output_len = 5000  # Commented out to allow --sharegpt-output-len to work
         if len(real_prompt_token_ids) < 10 or output_len < 4:
             # Prune too short sequences.
@@ -962,6 +978,7 @@ async def benchmark(
     kv_cache_monitor: Optional[KVCacheMonitor] = None,
     warmup_ratio: float = 0.1,
     carbon_params: Optional[Dict[str, Any]] = None,
+    server_max_model_len: Optional[int] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -972,6 +989,28 @@ async def benchmark(
     print(input_requests[0])
     test_prompt, test_prompt_len, test_output_len, test_mm_content = (
         input_requests[0])
+
+    # Clamp output_len to avoid exceeding model context length
+    # Use server-provided max_model_len if available, otherwise fall back to tokenizer
+    if server_max_model_len is not None:
+        max_model_len = server_max_model_len
+        print(f"Using server-reported max_model_len: {max_model_len}")
+    else:
+        max_model_len = getattr(tokenizer, 'model_max_length', 4096)
+        if max_model_len is None or max_model_len > 100000:
+            max_model_len = 4096
+        print(f"Using tokenizer max_model_len: {max_model_len}")
+
+    # Ensure prompt_len + output_len doesn't exceed max_model_len
+    # Leave some headroom (50 tokens) for special tokens
+    max_output_len = max_model_len - test_prompt_len - 50
+    if test_output_len > max_output_len:
+        print(f"WARNING: Clamping output_len from {test_output_len} to {max_output_len} "
+              f"to avoid exceeding model max length ({max_model_len}) "
+              f"with prompt_len ({test_prompt_len})")
+        test_output_len = max(4, max_output_len)  # Ensure at least 4 tokens
+    print(f"Test will use prompt_len={test_prompt_len}, output_len={test_output_len}")
+
     if backend != "openai-chat" and test_mm_content is not None:
         # multi-modal benchmark is only available on OpenAI Chat backend.
         raise ValueError(
@@ -1317,6 +1356,32 @@ async def benchmark(
     return result
 
 
+async def get_server_max_model_len(base_url: str) -> Optional[int]:
+    """
+    Fetch the actual max_model_len from vLLM server's /v1/models endpoint.
+
+    Args:
+        base_url: Base URL of the vLLM server (e.g., "http://localhost:8000")
+
+    Returns:
+        The max_model_len if available, None otherwise
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{base_url}/v1/models"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("data") and len(data["data"]) > 0:
+                        max_len = data["data"][0].get("max_model_len")
+                        if max_len is not None:
+                            return int(max_len)
+    except Exception as e:
+        print(f"Warning: Failed to fetch max_model_len from server: {e}")
+
+    return None
+
+
 async def get_kv_cache_stats(base_url: str, enable_trace: bool = False, sample_count: int = 1) -> Dict[str, Any]:
     """
     Fetch KV cache statistics from vLLM server's /metrics endpoint.
@@ -1515,10 +1580,17 @@ def main(args: argparse.Namespace):
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         base_url = f"http://{args.host}:{args.port}"
 
-    
+
 
     tokenizer = get_tokenizer(tokenizer_id,
                               trust_remote_code=args.trust_remote_code)
+
+    # Fetch max_model_len from server for dynamic context length management
+    server_max_model_len = asyncio.run(get_server_max_model_len(base_url))
+    if server_max_model_len is not None:
+        print(f"✓ Fetched max_model_len from server: {server_max_model_len}")
+    else:
+        print("⚠ Could not fetch max_model_len from server, using tokenizer defaults")
 
     if args.dataset is not None:
         warnings.warn(
@@ -1533,6 +1605,7 @@ def main(args: argparse.Namespace):
             fixed_input_len=args.sharegpt_input_len,
             fixed_output_len=args.sharegpt_output_len,
             min_prompt_len=args.min_prompt_len,
+            server_max_model_len=server_max_model_len,
         )
 
     elif args.dataset_name == "sharegpt":
@@ -1543,6 +1616,7 @@ def main(args: argparse.Namespace):
             fixed_input_len=args.sharegpt_input_len,
             fixed_output_len=args.sharegpt_output_len,
             min_prompt_len=args.min_prompt_len,
+            server_max_model_len=server_max_model_len,
         )
 
     elif args.dataset_name == "arenahard":
@@ -1710,6 +1784,7 @@ def main(args: argparse.Namespace):
             kv_cache_monitor=kv_cache_monitor,
             warmup_ratio=args.warmup_ratio,
             carbon_params=carbon_params,
+            server_max_model_len=server_max_model_len,
         ))
 
     # Save config and results to json
