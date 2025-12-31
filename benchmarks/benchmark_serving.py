@@ -1818,71 +1818,96 @@ def main(args: argparse.Namespace):
 
         # Merge with benchmark result
         result_json = {**result_json, **benchmark_result}
-        
+
         # Fetch KV cache statistics from server
         if backend == "vllm":
             print("\nFetching KV cache statistics from server...")
-            enable_trace = args.enable_kv_trace if hasattr(args, 'enable_kv_trace') else False
-            # Collect 5 samples over 2 seconds to get better dynamic stats
-            kv_cache_stats = asyncio.run(get_kv_cache_stats(base_url, enable_trace=enable_trace, sample_count=5))
-            if kv_cache_stats and (kv_cache_stats.get('static_config') or kv_cache_stats.get('dynamic_stats')):
+
+            # Check if we already have KV cache monitoring data from benchmark run
+            kv_monitoring_stats = result_json.get("kv_cache_monitoring_stats")
+
+            if kv_monitoring_stats and kv_monitoring_stats.get("samples_collected", 0) > 0:
+                # Use the real-time monitoring data collected during benchmark
+                print(f"  Using real-time monitoring data ({kv_monitoring_stats['samples_collected']} samples)")
+
+                detailed = kv_monitoring_stats.get("detailed_stats", {})
+                avg_stats = kv_monitoring_stats.get("avg_stats", {})
+                static_cfg = detailed.get("static_config", {})
+
+                # Build kv_cache_stats from monitoring data
+                kv_cache_stats = {
+                    "static_config": static_cfg,
+                    "dynamic_stats": {
+                        # Cache usage stats
+                        "cache_usage_perc_avg": avg_stats.get("avg_cache_usage_perc", 0),
+                        "cache_usage_perc_max": detailed.get("cache_usage", {}).get("max", 0),
+                        "cache_usage_perc_min": detailed.get("cache_usage", {}).get("min", 0),
+                        # Request stats
+                        "num_requests_running_avg": avg_stats.get("avg_requests_running", 0),
+                        "num_requests_running_max": detailed.get("requests_running", {}).get("max", 0),
+                        "num_requests_running_min": detailed.get("requests_running", {}).get("min", 0),
+                        "num_requests_waiting_avg": avg_stats.get("avg_requests_waiting", 0),
+                        "num_requests_waiting_max": detailed.get("requests_waiting", {}).get("max", 0),
+                        "num_requests_waiting_min": detailed.get("requests_waiting", {}).get("min", 0),
+                        # GPU blocks stats
+                        "used_gpu_blocks_avg": avg_stats.get("avg_used_blocks", 0),
+                        "free_gpu_blocks_avg": avg_stats.get("avg_free_blocks", 0),
+                        "used_kv_cache_tokens_avg": avg_stats.get("avg_used_tokens", 0),
+                        # Peak values
+                        "used_gpu_blocks_peak": detailed.get("used_blocks", {}).get("max", 0),
+                        "free_gpu_blocks_min": detailed.get("used_blocks", {}).get("min", 0),
+                        "used_kv_cache_tokens_peak": detailed.get("used_tokens", {}).get("max", 0),
+                        # Combined usage percentage
+                        "kv_cache_usage_percentage": avg_stats.get("avg_cache_usage_perc", 0) * 100,
+                    },
+                    "dynamic_samples": [],
+                    "trace_info": {
+                        "timestamp": datetime.now().isoformat(),
+                        "collection_method": "prometheus_metrics_realtime",
+                        "samples_collected": kv_monitoring_stats.get("samples_collected", 0),
+                    },
+                }
                 result_json["kv_cache_stats"] = kv_cache_stats
-                
-                # Print static configuration (固定值)
-                static_cfg = kv_cache_stats.get('static_config', {})
+
+                # Print static configuration
                 if static_cfg:
                     print("\n" + "=" * 50)
-                    print("KV Cache Static Configuration (固定配置):")
+                    print("KV Cache Static Configuration:")
                     print("=" * 50)
                     if 'total_gpu_blocks' in static_cfg:
-                        print(f"  GPU总KV块数 (Total GPU Blocks): {static_cfg['total_gpu_blocks']}")
+                        print(f"  Total GPU Blocks: {static_cfg['total_gpu_blocks']}")
                     if 'block_size' in static_cfg:
-                        print(f"  KV块大小 (Block Size): {static_cfg['block_size']}")
+                        print(f"  Block Size: {static_cfg['block_size']}")
                     if 'tokens_per_block' in static_cfg:
-                        print(f"  每块容纳Token数 (Tokens per Block): {static_cfg['tokens_per_block']}")
+                        print(f"  Tokens per Block: {static_cfg['tokens_per_block']}")
                     if 'total_kv_cache_tokens' in static_cfg:
-                        print(f"  总KV缓存容量 (Total KV Cache Tokens): {static_cfg['total_kv_cache_tokens']:,}")
-                    if 'num_layers' in static_cfg:
-                        print(f"  模型层数 (Number of Layers): {static_cfg['num_layers']}")
-                    if 'num_heads' in static_cfg:
-                        print(f"  KV头数 (Number of KV Heads): {static_cfg['num_heads']}")
-                    if 'head_size' in static_cfg:
-                        print(f"  头维度 (Head Size): {static_cfg['head_size']}")
-                
-                # Print dynamic statistics (实时值)
-                dynamic_stats = kv_cache_stats.get('dynamic_stats', {})
+                        print(f"  Total KV Cache Tokens: {static_cfg['total_kv_cache_tokens']:,}")
+
+                # Print dynamic statistics from real-time monitoring
+                dynamic_stats = kv_cache_stats.get("dynamic_stats", {})
                 if dynamic_stats:
                     print("\n" + "=" * 50)
-                    print("KV Cache Dynamic Statistics (动态统计):")
+                    print("KV Cache Dynamic Statistics (Real-time Monitoring):")
                     print("=" * 50)
-                    
-                    # Average usage
-                    if 'used_gpu_blocks_avg' in dynamic_stats:
-                        print(f"  平均已用KV块数 (Avg Used GPU Blocks): {dynamic_stats['used_gpu_blocks_avg']}")
-                    if 'free_gpu_blocks_avg' in dynamic_stats:
-                        print(f"  平均空闲KV块数 (Avg Free GPU Blocks): {dynamic_stats['free_gpu_blocks_avg']}")
                     if 'kv_cache_usage_percentage' in dynamic_stats:
-                        print(f"  平均KV缓存使用率 (Avg Usage %): {dynamic_stats['kv_cache_usage_percentage']}%")
+                        print(f"  Avg Cache Usage: {dynamic_stats['kv_cache_usage_percentage']:.2f}%")
                     if 'used_kv_cache_tokens_avg' in dynamic_stats:
-                        print(f"  平均已用KV缓存Token数 (Avg Used Tokens): {dynamic_stats['used_kv_cache_tokens_avg']:,}")
-                    
-                    # Peak usage
-                    if 'used_gpu_blocks_peak' in dynamic_stats:
-                        print(f"  峰值已用KV块数 (Peak Used GPU Blocks): {dynamic_stats['used_gpu_blocks_peak']}")
+                        print(f"  Avg Used Tokens: {dynamic_stats['used_kv_cache_tokens_avg']:,.0f}")
                     if 'used_kv_cache_tokens_peak' in dynamic_stats:
-                        print(f"  峰值已用KV缓存Token数 (Peak Used Tokens): {dynamic_stats['used_kv_cache_tokens_peak']:,}")
-                    
-                    # Running/waiting requests
+                        print(f"  Peak Used Tokens: {dynamic_stats['used_kv_cache_tokens_peak']:,}")
                     if 'num_requests_running_avg' in dynamic_stats:
-                        print(f"  平均运行中的请求数 (Avg Running Requests): {dynamic_stats['num_requests_running_avg']:.1f}")
+                        print(f"  Avg Running Requests: {dynamic_stats['num_requests_running_avg']:.1f}")
                     if 'num_requests_running_max' in dynamic_stats:
-                        print(f"  最大运行中的请求数 (Max Running Requests): {int(dynamic_stats['num_requests_running_max'])}")
-                    if 'num_requests_waiting_avg' in dynamic_stats:
-                        print(f"  平均等待中的请求数 (Avg Waiting Requests): {dynamic_stats['num_requests_waiting_avg']:.1f}")
-                    if 'num_requests_waiting_max' in dynamic_stats:
-                        print(f"  最大等待中的请求数 (Max Waiting Requests): {int(dynamic_stats['num_requests_waiting_max'])}")
-                
+                        print(f"  Max Running Requests: {int(dynamic_stats['num_requests_running_max'])}")
+
                 print("=" * 50)
+            else:
+                # Fallback: collect KV cache stats after benchmark (may be empty if benchmark just finished)
+                enable_trace = args.enable_kv_trace if hasattr(args, 'enable_kv_trace') else False
+                kv_cache_stats = asyncio.run(get_kv_cache_stats(base_url, enable_trace=enable_trace, sample_count=5))
+                if kv_cache_stats and (kv_cache_stats.get('static_config') or kv_cache_stats.get('dynamic_stats')):
+                    result_json["kv_cache_stats"] = kv_cache_stats
+                    # ... (rest of existing code for printing static/dynamic config)
 
         # Save to file
         base_model_id = model_id.split("/")[-1]
