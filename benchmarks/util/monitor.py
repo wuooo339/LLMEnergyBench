@@ -43,6 +43,8 @@ class GPUMonitor:
         gpu_power_readings = []
         gpu_utilization_readings = []
         memory_utilization_readings = []
+        memory_used_mb_readings = []
+        total_memory_mb = 0.0
         if self.monitor_clock:
             gpu_clock_readings = []
         
@@ -50,12 +52,14 @@ class GPUMonitor:
             power = nvmlDeviceGetPowerUsage(self.gpu_handle)
             utilization = nvmlDeviceGetUtilizationRates(self.gpu_handle)
             memory = nvmlDeviceGetMemoryInfo(self.gpu_handle)
+            total_memory_mb = memory.total / (1024 * 1024)
 
             gpu_power_readings.append(power)
             gpu_utilization_readings.append(utilization.gpu)
             # DO NOT USE utilization.memory, it is not what we want
             # utilization.memory is "Percent of time over the past second in which any framebuffer memory has been read or stored."
             memory_utilization_readings.append(memory.used / memory.total * 100)
+            memory_used_mb_readings.append(memory.used / (1024 * 1024))
 
             if self.monitor_clock:
                 graphics_clock = nvmlDeviceGetClockInfo(self.gpu_handle, 0)
@@ -72,6 +76,7 @@ class GPUMonitor:
             gpu_power_readings = gpu_power_readings[seconds_to_truncate:-seconds_to_truncate]
             gpu_utilization_readings = gpu_utilization_readings[seconds_to_truncate:-seconds_to_truncate]
             memory_utilization_readings = memory_utilization_readings[seconds_to_truncate:-seconds_to_truncate]
+            memory_used_mb_readings = memory_used_mb_readings[seconds_to_truncate:-seconds_to_truncate]
 
         avg_power = sum(gpu_power_readings) / len(gpu_power_readings) if gpu_power_readings else 0
         avg_gpu_util = sum(gpu_utilization_readings) / len(gpu_utilization_readings) if gpu_utilization_readings else 0
@@ -87,6 +92,8 @@ class GPUMonitor:
         power_95p = np.percentile(gpu_power_readings, 95) if gpu_power_readings else 0
         max_power = max(gpu_power_readings) if gpu_power_readings else 0
         power_std = np.std(np.array(gpu_power_readings)/1000) if gpu_power_readings else 0
+        peak_memory_used_mb = float(max(memory_used_mb_readings)) if memory_used_mb_readings else 0.0
+        avg_memory_used_mb = float(np.mean(memory_used_mb_readings)) if memory_used_mb_readings else 0.0
 
         self.stats_queue.put({
             "min_power": min_power,
@@ -96,13 +103,25 @@ class GPUMonitor:
             "power_75p": power_75p,
             "power_95p": power_95p,
             "max_power": max_power,
-            "power_std": power_std
+            "power_std": power_std,
+            "peak_memory_used_mb": peak_memory_used_mb,
+            "avg_memory_used_mb": avg_memory_used_mb,
+            "total_memory_mb": total_memory_mb,
         })
 
         if self.monitor_clock:
-            self.hist_queue.put([gpu_power_readings, memory_utilization_readings, gpu_clock_readings])
+            self.hist_queue.put(
+                [
+                    gpu_power_readings,
+                    memory_utilization_readings,
+                    memory_used_mb_readings,
+                    gpu_clock_readings,
+                ]
+            )
         else:
-            self.hist_queue.put([gpu_power_readings, memory_utilization_readings])
+            self.hist_queue.put(
+                [gpu_power_readings, memory_utilization_readings, memory_used_mb_readings]
+            )
 
     def __del__(self):
         if self.gpu_handle:

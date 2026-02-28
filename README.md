@@ -3,6 +3,119 @@
 基于 FUEL 框架的 vLLM 性能和功耗测试工具，支持实时 GPU/CPU 监控和详细的性能指标收集。
 
 ---
+## PageEviction 快速命令（放在最前）
+
+下面以 `Llama-3.1-70B-Instruct` 为例，给出四种常见启动方式。
+
+### 1) 不开 PageEviction，不开投机解码（原生基线）
+```bash
+vllm serve /share-data/models/Llama-3.1-70B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  -tp 16 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.95 \
+  --dtype half \
+  --enforce-eager
+```
+
+### 2) 不开 PageEviction，开投机解码
+```bash
+vllm serve /share-data/models/Llama-3.1-70B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  -tp 16 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.95 \
+  --dtype half \
+  --enforce-eager \
+  --speculative-config '{"method":"draft_model","model":"/share-data/models/Llama-3.1-8B-Instruct","num_speculative_tokens":4}'
+```
+
+### 3) 开 PageEviction，不开投机解码
+```bash
+vllm serve /share-data/models/Llama-3.1-70B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  -tp 16 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.95 \
+  --dtype half \
+  --enforce-eager \
+  --enable-paged-eviction \
+  --kv-cache-budget 4096
+```
+
+### 4) 开 PageEviction，开投机解码
+```bash
+vllm serve /share-data/models/Llama-3.1-70B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  -tp 16 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.95 \
+  --dtype half \
+  --enforce-eager \
+  --enable-paged-eviction \
+  --kv-cache-budget 4096 \
+  --speculative-config '{"method":"draft_model","model":"/share-data/models/Llama-3.1-8B-Instruct","num_speculative_tokens":4}'
+```
+
+说明：
+- 不带 `--enable-paged-eviction` 时，PageEviction 逻辑不会启用，走原生推理路径。
+- 同一套 benchmark 脚本可覆盖“有/无 PageEviction”和“有/无 speculative decode”。
+- `run_benchmark.sh` 在 PE 关闭时会正常输出结果；PageEviction 监控字段为 0，不会影响吞吐/能耗统计。
+
+最简 A/B 对比脚本（自动跑 PE off/on 两轮并输出能耗、吞吐对比）：
+```bash
+cd /home/wzk/LLMEnergyBench
+./run_page_eviction_ab.sh
+```
+
+运行完成后会自动生成两份汇总文件（同一时间戳）：
+- `page_eviction_ab_summary_<timestamp>.csv`
+- `page_eviction_ab_summary_<timestamp>.png`
+
+新增（用于 V1 对齐 v0 性能模式验证）的 PE 指标会写到 CSV 中，主要包括：
+- `pe.prefill_reqs_scheduled.total`
+- `pe.prefill_reqs_query_len_gt_budget.total`
+- `pe.prefill_reqs_query_len_gt_budget.ratio`
+- `pe.replace_block_req_ids.total`
+- `pe.replace_block_req_ids_per_sample.{p50,p90,p99}`
+- `pe.score_collect.calls_single.total`
+- `pe.score_collect.calls_ubatch_list.total`
+- `pe.score_collect.return_none_ubatch_list.total`
+- `pe.score_collect.return_none_ubatch_ratio`
+- `pe.prefill_block_scores_returned.total`
+- `pe.decode_token_scores_returned.total`
+- `pe.prefill_compress_invocations.total`
+- `pe.prefill_compress_invocations_per_request.mean`
+
+这些指标来源于 vLLM `/metrics` 的 PageEviction 新增计数器；`run_page_eviction_ab.sh` 通过 `KVCacheMonitor` 抓取并汇总后写入 `page_eviction_monitoring_stats.*`，最后进入 A/B CSV。
+
+如需对某个历史 CSV 手动重画图：
+```bash
+python /home/wzk/LLMEnergyBench/benchmark_results/page_eviction_ab/draw_compare.py \
+  /home/wzk/LLMEnergyBench/benchmark_results/page_eviction_ab/page_eviction_ab_summary_<timestamp>.csv
+```
+
+`run_page_eviction_ab.sh` 用法（支持环境变量覆盖）：
+- 默认每轮请求数：`BENCH_NUM_PROMPTS=256`（A/B 两轮共 512 请求）
+- 默认开启 speculative decode：`USE_SPEC_DECODE=1`
+- 新增：`PE_CHUNKED_PREFILL=0/1`（仅影响 PE on 轮次）
+  - `0`：strict（默认，PE on 时保持单次 prefill 语义）
+  - `1`：perf（PE on 时允许 chunked prefill）
+
+对比口径说明：
+- 该脚本仍是 **PE off vs PE on** 的 A/B。
+- `PE_CHUNKED_PREFILL` 只是 PE on 轮次的子模式开关（strict/perf），用于评估“PE on 时是否保留 chunked prefill”的影响。
+
+推荐测试：
+
+```bash
+PE_CHUNKED_PREFILL=1 USE_SPEC_DECODE=0 KV_CACHE_BUDGET=1792 MIN_PROMPT_LEN=1000 BENCH_NUM_PROMPTS=128 BENCH_OUTPUT_LEN=512 BENCH_REQUEST_RATE=2 CLEAR_RESULTS=1 ./run_page_eviction_ab.sh
+```
+---
 ## 快速开始
 ### 环境准备
 **安装 vLLM**
@@ -14,15 +127,40 @@ pip install vllm
 #### 第 1 步：启动 vLLM 服务器
 
 ```bash
-vllm serve /share-data/wzk-1/model/deepseek-v2-lite \
+VLLM_ATTENTION_BACKEND=pytorch vllm serve /share-data/models/Mixtral-8x22B-v0.1 \
+     --host 0.0.0.0 \
+     --port 8000 \
+     --tensor-parallel-size 16 \
+     --gpu-memory-utilization 0.85 \
+     --max-model-len 4096 \
+     --max-num-batched-tokens 8192 \
+     --max-num-seqs 64 \
+     --dtype half \
+     --enforce-eager
+
+# Using speculative decode For Llama-3.1
+vllm serve /share-data/models/Llama-3.1-70B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  -tp 16 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.95 \
+  --dtype half \
+  --enforce-eager \
+  --speculative-config '{"method":"draft_model","model":"/share-data/models/Llama-3.1-8B-Instruct","num_speculative_tokens":4}'
+
+# Using speculative decode for Qwen3
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  vllm serve /share-data/models/Qwen3-32B \
     --host 0.0.0.0 \
     --port 8000 \
-    --tensor-parallel-size 4 \
-    --gpu-memory-utilization 0.9 \
-    --max-model-len 4096 \
-    --max-num-batched-tokens 163840 \
-    --max-num-seqs 128
+    -tp 4 \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.95 \
+    --speculative-config '{"method":"draft_model","model":"/share-data/models/Qwen3-4B","num_speculative_tokens":4}'
 ```
+
+
 
 **参数说明**:
 - `--tensor-parallel-size 2`: 使用 2 个 GPU 进行张量并行
@@ -35,7 +173,7 @@ vllm serve /share-data/wzk-1/model/deepseek-v2-lite \
 在**另一个终端**中运行：
 
 ```bash
-cd /home/user/offload/FUEL
+cd /home/wzk/LLMEnergyBench
 ./run_benchmark.sh
 ```
 
@@ -287,16 +425,6 @@ print(f"GPU 0 功耗 P95: {power_95p_gpu0 / 1000:.2f}W")
 
 本项目基于 [FUEL (Functional Unit-based Evaluation for LLMs)](https://github.com/jojacola/FUEL)框架开发，FUEL 是一个用于评估 LLM 服务碳排放影响的创新框架。
 
-### 主要改进
-
-在 FUEL 原始框架基础上，本项目做了以下增强：
-
-1. **简化的测试流程**: 提供一键运行脚本 `run_benchmark.sh`
-2. **更好的可观测性**: 添加客户端请求 ID 跟踪和实时 token 生成日志
-3. **修复的时间计算**: 解决了原始代码中的 `completion_time` 和时间同步问题
-4. **完善的监控集成**: GPU/CPU 监控器正确启动和停止
-5. **清晰的文档**: 面向实际使用的中文文档
-
 ### 引用
 
 如果您在研究中使用了本工具，请引用 FUEL 原始论文：
@@ -312,10 +440,23 @@ print(f"GPU 0 功耗 P95: {power_95p_gpu0 / 1000:.2f}W")
 
 ---
 
-## License
+### 📌 Fix vLLM `undefined symbol: dsv3_fused_a_gemm` on V100 GPUs
 
-本项目继承 FUEL 的 Apache-2.0 License。
+When building vLLM from source on older GPUs like NVIDIA V100 (Volta architecture, Compute Capability 7.0), starting the server or importing vLLM crashes with the following error:
+ImportError: /path/to/vllm/_C.abi3.so: undefined symbol: _Z17dsv3_fused_a_gemmRN2at6TensorERKS0_S3_
 
-## 贡献
+```shell
+vim csrc/torch_bindings.cpp
+```
+Around line 244, locate the ops.define and ops.impl lines for dsv3_fused_a_gemm. Comment them out using //:
 
-欢迎提交 Issue 和 Pull Request！
+```C++
+//  ops.define(
+//      "dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+//  ops.impl("dsv3_fused_a_gemm", torch::kCUDA, &dsv3_fused_a_gemm);
+```
+Set your target compute capability (7.0 for V100) and perform an incremental build:
+```shell
+export TORCH_CUDA_ARCH_LIST="7.0"
+pip install -e .
+```

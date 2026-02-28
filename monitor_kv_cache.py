@@ -70,6 +70,11 @@ def print_dynamic_stats(current_stats, history_stats):
     used_tokens = current_stats.get('used_tokens', 0)
     running = current_stats.get('num_requests_running', 0)
     waiting = current_stats.get('num_requests_waiting', 0)
+    page_eviction_ops_total = current_stats.get('page_eviction_ops_total', 0)
+    page_eviction_blocks_total = current_stats.get('page_eviction_blocks_total', 0)
+    spec_draft_tokens_total = current_stats.get('spec_decode_draft_tokens_total', 0)
+    spec_accepted_tokens_total = current_stats.get('spec_decode_accepted_tokens_total', 0)
+    spec_acceptance_rate = current_stats.get('spec_decode_acceptance_rate', 0)
     
     print(f"  Cache 使用率:      {format_percentage(cache_usage * 100)}")
     print(f"  已用 Blocks:       {format_number(used_blocks)}")
@@ -77,6 +82,11 @@ def print_dynamic_stats(current_stats, history_stats):
     print(f"  已用 Tokens:       {format_number(used_tokens)}")
     print(f"  运行中的请求:      {format_number(running)}")
     print(f"  等待中的请求:      {format_number(waiting)}")
+    print(f"  PageEviction 次数: {format_number(page_eviction_ops_total)}")
+    print(f"  驱逐 Block 总数:   {format_number(page_eviction_blocks_total)}")
+    print(f"  Spec Draft Tokens: {format_number(spec_draft_tokens_total)}")
+    print(f"  Spec Accept Tokens:{format_number(spec_accepted_tokens_total)}")
+    print(f"  Spec 接受率:       {spec_acceptance_rate:.4f}")
     
     # 历史统计（如果有）
     if history_stats and len(history_stats) > 0:
@@ -87,6 +97,25 @@ def print_dynamic_stats(current_stats, history_stats):
         avg_used_blocks = sum(s.get('used_blocks', 0) for s in history_stats) / len(history_stats)
         avg_running = sum(s.get('num_requests_running', 0) for s in history_stats) / len(history_stats)
         avg_waiting = sum(s.get('num_requests_waiting', 0) for s in history_stats) / len(history_stats)
+        evict_ops_delta = (
+            history_stats[-1].get('page_eviction_ops_total', 0)
+            - history_stats[0].get('page_eviction_ops_total', 0)
+        )
+        evict_blocks_delta = (
+            history_stats[-1].get('page_eviction_blocks_total', 0)
+            - history_stats[0].get('page_eviction_blocks_total', 0)
+        )
+        spec_draft_delta = (
+            history_stats[-1].get('spec_decode_draft_tokens_total', 0)
+            - history_stats[0].get('spec_decode_draft_tokens_total', 0)
+        )
+        spec_accepted_delta = (
+            history_stats[-1].get('spec_decode_accepted_tokens_total', 0)
+            - history_stats[0].get('spec_decode_accepted_tokens_total', 0)
+        )
+        spec_acceptance = (
+            spec_accepted_delta / spec_draft_delta if spec_draft_delta > 0 else 0
+        )
         
         # 计算峰值
         max_cache = max(s.get('cache_usage_perc', 0) for s in history_stats)
@@ -100,6 +129,11 @@ def print_dynamic_stats(current_stats, history_stats):
         print(f"  平均运行请求数:    {format_number(avg_running)}")
         print(f"  峰值运行请求数:    {format_number(max_running)}")
         print(f"  平均等待请求数:    {format_number(avg_waiting)}")
+        print(f"  PageEviction 增量: {format_number(evict_ops_delta)} ops")
+        print(f"  驱逐 Block 增量:   {format_number(evict_blocks_delta)} blocks")
+        print(f"  Spec Draft 增量:   {format_number(spec_draft_delta)}")
+        print(f"  Spec 接受 增量:    {format_number(spec_accepted_delta)}")
+        print(f"  Spec 接受率增量:   {spec_acceptance:.4f}")
         print(f"  采样数量:          {len(history_stats)}")
 
 
@@ -199,6 +233,11 @@ def main():
         'used_tokens': [],
         'num_requests_running': [],
         'num_requests_waiting': [],
+        'page_eviction_ops_total': [],
+        'page_eviction_blocks_total': [],
+        'spec_decode_draft_tokens_total': [],
+        'spec_decode_accepted_tokens_total': [],
+        'spec_decode_acceptance_rate': [],
         'timestamps': []
     }
     
@@ -244,6 +283,11 @@ def main():
                 current_stats['cache_usage_perc'] = current_state.get('kv_cache_usage', 0)
                 current_stats['num_requests_running'] = current_state.get('num_requests_running', 0)
                 current_stats['num_requests_waiting'] = current_state.get('num_requests_waiting', 0)
+                current_stats['page_eviction_ops_total'] = current_state.get('page_eviction_ops_total', 0)
+                current_stats['page_eviction_blocks_total'] = current_state.get('page_eviction_blocks_total', 0)
+                current_stats['spec_decode_draft_tokens_total'] = current_state.get('spec_decode_draft_tokens_total', 0)
+                current_stats['spec_decode_accepted_tokens_total'] = current_state.get('spec_decode_accepted_tokens_total', 0)
+                current_stats['spec_decode_acceptance_rate'] = current_state.get('spec_decode_acceptance_rate', 0)
                 
                 # 计算 blocks 信息
                 if 'kv_blocks_used_ratio' in current_state and 'total_gpu_blocks' in static_config:
@@ -262,6 +306,11 @@ def main():
                 history_cache['used_tokens'].append(current_stats.get('used_tokens', 0))
                 history_cache['num_requests_running'].append(current_stats.get('num_requests_running', 0))
                 history_cache['num_requests_waiting'].append(current_stats.get('num_requests_waiting', 0))
+                history_cache['page_eviction_ops_total'].append(current_stats.get('page_eviction_ops_total', 0))
+                history_cache['page_eviction_blocks_total'].append(current_stats.get('page_eviction_blocks_total', 0))
+                history_cache['spec_decode_draft_tokens_total'].append(current_stats.get('spec_decode_draft_tokens_total', 0))
+                history_cache['spec_decode_accepted_tokens_total'].append(current_stats.get('spec_decode_accepted_tokens_total', 0))
+                history_cache['spec_decode_acceptance_rate'].append(current_stats.get('spec_decode_acceptance_rate', 0))
                 history_cache['timestamps'].append(current_timestamp)
                 
                 # 记录到 trace 数据（用于保存）
@@ -275,6 +324,11 @@ def main():
                     'used_tokens': current_stats.get('used_tokens', 0),
                     'requests_running': current_stats.get('num_requests_running', 0),
                     'requests_waiting': current_stats.get('num_requests_waiting', 0),
+                    'page_eviction_ops_total': current_stats.get('page_eviction_ops_total', 0),
+                    'page_eviction_blocks_total': current_stats.get('page_eviction_blocks_total', 0),
+                    'spec_decode_draft_tokens_total': current_stats.get('spec_decode_draft_tokens_total', 0),
+                    'spec_decode_accepted_tokens_total': current_stats.get('spec_decode_accepted_tokens_total', 0),
+                    'spec_decode_acceptance_rate': round(current_stats.get('spec_decode_acceptance_rate', 0), 6),
                 }
                 trace_data['trace'].append(trace_point)
                 
@@ -292,6 +346,11 @@ def main():
                         'used_blocks': history_cache['used_blocks'][i],
                         'num_requests_running': history_cache['num_requests_running'][i],
                         'num_requests_waiting': history_cache['num_requests_waiting'][i],
+                        'page_eviction_ops_total': history_cache['page_eviction_ops_total'][i],
+                        'page_eviction_blocks_total': history_cache['page_eviction_blocks_total'][i],
+                        'spec_decode_draft_tokens_total': history_cache['spec_decode_draft_tokens_total'][i],
+                        'spec_decode_accepted_tokens_total': history_cache['spec_decode_accepted_tokens_total'][i],
+                        'spec_decode_acceptance_rate': history_cache['spec_decode_acceptance_rate'][i],
                     }
                     history_stats.append(stat_point)
             
@@ -343,23 +402,51 @@ def main():
             avg_blocks = sum(history_cache['used_blocks']) / len(history_cache['used_blocks'])
             avg_running = sum(history_cache['num_requests_running']) / len(history_cache['num_requests_running'])
             avg_waiting = sum(history_cache['num_requests_waiting']) / len(history_cache['num_requests_waiting'])
+            avg_spec_accept = sum(history_cache['spec_decode_acceptance_rate']) / len(
+                history_cache['spec_decode_acceptance_rate']
+            )
             
             max_cache = max(history_cache['cache_usage_perc'])
             max_blocks = max(history_cache['used_blocks'])
             max_running = max(history_cache['num_requests_running'])
             max_waiting = max(history_cache['num_requests_waiting'])
+            total_page_evict_ops = (
+                history_cache['page_eviction_ops_total'][-1]
+                - history_cache['page_eviction_ops_total'][0]
+            )
+            total_page_evict_blocks = (
+                history_cache['page_eviction_blocks_total'][-1]
+                - history_cache['page_eviction_blocks_total'][0]
+            )
+            total_spec_draft = (
+                history_cache['spec_decode_draft_tokens_total'][-1]
+                - history_cache['spec_decode_draft_tokens_total'][0]
+            )
+            total_spec_accept = (
+                history_cache['spec_decode_accepted_tokens_total'][-1]
+                - history_cache['spec_decode_accepted_tokens_total'][0]
+            )
+            total_spec_accept_rate = (
+                total_spec_accept / total_spec_draft if total_spec_draft > 0 else 0
+            )
             
             print("\n平均值:")
             print(f"  Cache 使用率: {format_percentage(avg_cache * 100)}")
             print(f"  已用 Blocks: {format_number(avg_blocks)}")
             print(f"  运行请求数: {format_number(avg_running)}")
             print(f"  等待请求数: {format_number(avg_waiting)}")
-            
+            print(f"  Spec 接受率: {avg_spec_accept:.4f}")
+
             print("\n峰值:")
             print(f"  Cache 使用率: {format_percentage(max_cache * 100)}")
             print(f"  已用 Blocks: {format_number(max_blocks)}")
             print(f"  运行请求数: {format_number(max_running)}")
             print(f"  等待请求数: {format_number(max_waiting)}")
+            print(f"  PageEviction 总次数: {format_number(total_page_evict_ops)}")
+            print(f"  驱逐 Block 总数: {format_number(total_page_evict_blocks)}")
+            print(f"  Spec Draft 总量: {format_number(total_spec_draft)}")
+            print(f"  Spec 接受总量: {format_number(total_spec_accept)}")
+            print(f"  Spec 总接受率: {total_spec_accept_rate:.4f}")
             
             # 添加统计到 trace_data
             trace_data['summary'] = {
@@ -368,12 +455,22 @@ def main():
                     'used_blocks': round(avg_blocks, 1),
                     'requests_running': round(avg_running, 1),
                     'requests_waiting': round(avg_waiting, 1),
+                    'spec_decode_acceptance_rate': round(avg_spec_accept, 6),
                 },
                 'peak': {
                     'cache_usage_perc': round(max_cache * 100, 2),
                     'used_blocks': max_blocks,
                     'requests_running': max_running,
                     'requests_waiting': max_waiting,
+                },
+                'page_eviction': {
+                    'total_eviction_ops': total_page_evict_ops,
+                    'total_evicted_blocks': total_page_evict_blocks,
+                },
+                'spec_decode': {
+                    'draft_tokens_total': total_spec_draft,
+                    'accepted_tokens_total': total_spec_accept,
+                    'acceptance_rate': round(total_spec_accept_rate, 6),
                 }
             }
         
@@ -405,4 +502,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

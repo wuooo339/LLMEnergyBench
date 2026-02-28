@@ -62,6 +62,11 @@ class RequestFuncOutput:
     completion_time: Optional[float] = None
     time_in_queue: Optional[float] = None
     cumulative_logprob: Optional[float] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    finish_reason: Optional[str] = None
+    stop_reason: Optional[Union[str, int]] = None
 
 
 async def async_request_tgi(
@@ -277,9 +282,14 @@ async def async_request_openai_completions(
             "temperature": 0.0,
             "best_of": request_func_input.best_of,
             "max_tokens": request_func_input.output_len,
-            "logprobs": 10,
             "stream": True,
+            # vLLM/OpenAI-compatible servers can include usage in stream
+            # summary chunks; this gives accurate accepted-token counts under
+            # speculative decoding.
+            "stream_options": {"include_usage": True},
         }
+        if request_func_input.logprobs is not None:
+            payload["logprobs"] = request_func_input.logprobs
         headers = {
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"
         }
@@ -297,6 +307,7 @@ async def async_request_openai_completions(
         most_recent_timestamp = st
         token_count = 0
         server_req_id = "unknown"
+        latency = 0.0
         
         try:
             async with session.post(url=api_url, json=payload,
@@ -313,26 +324,44 @@ async def async_request_openai_completions(
                             latency = time.perf_counter() - st
                         else:
                             data = json.loads(chunk)
-                            
+
                             # Get server request ID on first chunk
                             if token_count == 0:
                                 server_req_id = data.get("id", "unknown")[-8:]
 
+                            usage = data.get("usage")
+                            if usage:
+                                output.prompt_tokens = usage.get("prompt_tokens")
+                                output.completion_tokens = usage.get(
+                                    "completion_tokens"
+                                )
+                                output.total_tokens = usage.get("total_tokens")
+
+                            choices = data.get("choices") or []
+                            if not choices:
+                                continue
+
+                            choice = choices[0]
+                            if choice.get("finish_reason") is not None:
+                                output.finish_reason = str(choice.get("finish_reason"))
+                            if choice.get("stop_reason") is not None:
+                                output.stop_reason = choice.get("stop_reason")
                             # 提取 cumulative_logprob（如果有的话）
-                            if "logprobs" in data["choices"][0] and data["choices"][0]["logprobs"]:
-                                token_logprobs = data["choices"][0]["logprobs"].get("token_logprobs", [])
+                            if "logprobs" in choice and choice["logprobs"]:
+                                token_logprobs = choice["logprobs"].get(
+                                    "token_logprobs", []
+                                )
                                 if token_logprobs and token_logprobs[-1] is not None:
                                     if output.cumulative_logprob is None:
                                         output.cumulative_logprob = 0.0
                                     output.cumulative_logprob += token_logprobs[-1]
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            # NOTE: Some completion API might have a usage-only
+                            # stream chunk without text token.
+                            token_text = choice.get("text", "")
+                            if token_text:
                                 timestamp = time.perf_counter()
                                 token_count += 1
-                                token_text = data["choices"][0]["text"]
                                 
                                 # First token
                                 if ttft == 0.0:
@@ -350,6 +379,8 @@ async def async_request_openai_completions(
                                 most_recent_timestamp = timestamp
                                 generated_text += token_text
 
+                    if latency <= 0.0:
+                        latency = time.perf_counter() - st
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
@@ -365,10 +396,12 @@ async def async_request_openai_completions(
                 else:
                     output.error = response.reason or ""
                     output.success = False
+                    output.finish_reason = "error"
         except Exception:
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+            output.finish_reason = "error"
 
     if pbar:
         pbar.update(1)
@@ -399,6 +432,7 @@ async def async_request_openai_chat_completions(
             "temperature": 0.0,
             "max_tokens": request_func_input.output_len,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         headers = {
             "Content-Type": "application/json",
@@ -428,8 +462,23 @@ async def async_request_openai_chat_completions(
                         else:
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
+                            usage = data.get("usage")
+                            if usage:
+                                output.prompt_tokens = usage.get("prompt_tokens")
+                                output.completion_tokens = usage.get(
+                                    "completion_tokens"
+                                )
+                                output.total_tokens = usage.get("total_tokens")
 
-                            delta = data["choices"][0]["delta"]
+                            choices = data.get("choices") or []
+                            if not choices:
+                                continue
+                            choice = choices[0]
+                            if choice.get("finish_reason") is not None:
+                                output.finish_reason = str(choice.get("finish_reason"))
+                            if choice.get("stop_reason") is not None:
+                                output.stop_reason = choice.get("stop_reason")
+                            delta = choice.get("delta", {})
                             if delta.get("content", None):
                                 # First token
                                 if ttft == 0.0:
@@ -451,10 +500,12 @@ async def async_request_openai_chat_completions(
                 else:
                     output.error = response.reason or ""
                     output.success = False
+                    output.finish_reason = "error"
         except Exception:
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+            output.finish_reason = "error"
 
     if pbar:
         pbar.update(1)

@@ -23,9 +23,13 @@ from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 try:
-    from vllm.transformers_utils.tokenizer import get_tokenizer
+    from vllm.tokenizers import get_tokenizer
 except ImportError:
-    from backend_request_func import get_tokenizer
+    try:
+        # Backward compatibility for older vLLM versions.
+        from vllm.transformers_utils.tokenizer import get_tokenizer
+    except ImportError:
+        from backend_request_func import get_tokenizer
 
 try:
     from vllm.utils import FlexibleArgumentParser
@@ -901,13 +905,18 @@ def calculate_metrics(
     e2els: List[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
-            # We use the tokenizer to count the number of output tokens for all
-            # serving backends instead of looking at len(outputs[i].itl) since
-            # multiple output tokens may be bundled together
-            # Note : this may inflate the output token count slightly
-            output_len = len(
-                tokenizer(outputs[i].generated_text,
-                          add_special_tokens=False).input_ids)
+            # Prefer server-reported completion_tokens when available.
+            # This is more accurate for speculative decoding than re-tokenizing
+            # generated text on the client.
+            if outputs[i].completion_tokens is not None:
+                output_len = max(int(outputs[i].completion_tokens), 0)
+            else:
+                # Fallback for backends not returning usage in stream.
+                output_len = len(
+                    tokenizer(
+                        outputs[i].generated_text, add_special_tokens=False
+                    ).input_ids
+                )
             actual_output_lens.append(output_len)
             total_input += input_requests[i][1]
             if output_len > 1:
@@ -1174,6 +1183,19 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "cumulative_logprob": [output.cumulative_logprob for output in outputs],
+        "prompt_tokens_from_server": [output.prompt_tokens for output in outputs],
+        "completion_tokens_from_server": [
+            output.completion_tokens for output in outputs
+        ],
+        "total_tokens_from_server": [output.total_tokens for output in outputs],
+        "output_token_count_source": [
+            (
+                "server_usage"
+                if output.completion_tokens is not None
+                else "tokenizer_fallback"
+            )
+            for output in outputs
+        ],
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
@@ -1187,7 +1209,26 @@ async def benchmark(
         "prompt": [output.prompt for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "finish_reasons": [output.finish_reason for output in outputs],
+        "stop_reasons": [output.stop_reason for output in outputs],
     }
+    result["per_request"] = [
+        {
+            "request_index": i,
+            "prompt_len": outputs[i].prompt_len,
+            "output_len": actual_output_lens[i] if i < len(actual_output_lens) else 0,
+            "ttft_s": outputs[i].ttft,
+            "e2e_latency_s": outputs[i].latency,
+            "success": bool(outputs[i].success),
+            "error": outputs[i].error,
+            "finish_reason": outputs[i].finish_reason,
+            "stop_reason": outputs[i].stop_reason,
+            "prompt_tokens_from_server": outputs[i].prompt_tokens,
+            "completion_tokens_from_server": outputs[i].completion_tokens,
+            "total_tokens_from_server": outputs[i].total_tokens,
+        }
+        for i in range(len(outputs))
+    ]
 
     if gpu_monitors is not None:
         result["gpu_power_stats"] = {}
@@ -1216,6 +1257,7 @@ async def benchmark(
             print("{:<40} {:<10.2f}".format("Max Power (W):", power_stats["max_power"]/1000))
             print("{:<40} {:<10.2f}".format("Power Standard Deviation (W):",
                                             power_stats["power_std"]))
+            memory_used_mb_trace = power_trace[2] if len(power_trace) > 2 else []
             result["gpu_power_stats"][gpu_monitor.gpu_id] = {
                 "avg_power": avg_power,
                 "avg_gpu_util": avg_gpu_util,
@@ -1223,6 +1265,7 @@ async def benchmark(
                 "power_stats": power_stats,
                 "power_trace": power_trace[0],
                 "memory_util_trace": power_trace[1],
+                "memory_used_mb_trace": memory_used_mb_trace,
             }
         result["energy_stats"] = {}
         result["energy_stats"]["total_energy"] = result['duration'] * sum([result["gpu_power_stats"][gpu_monitor.gpu_id]["avg_power"] for gpu_monitor in gpu_monitors]) / 1000
@@ -1274,7 +1317,12 @@ async def benchmark(
         kv_trace = kv_cache_monitor.hist_queue.get()
         
         print("\n" + "=" * 70)
-        print("{s:^{n}}".format(s='KV Cache Statistics (Synchronized with GPU/CPU)', n=70))
+        print(
+            "{s:^{n}}".format(
+                s='KV Cache / PageEviction / Spec Metrics (Synchronized)',
+                n=70,
+            )
+        )
         print("=" * 70)
         print("{:<50} {:<20.2f}".format("Average Cache Usage (%):", avg_stats['avg_cache_usage_perc']))
         print("{:<50} {:<20,.0f}".format("Average Used Blocks:", avg_stats['avg_used_blocks']))
@@ -1282,6 +1330,59 @@ async def benchmark(
         print("{:<50} {:<20,.0f}".format("Average Used Tokens:", avg_stats['avg_used_tokens']))
         print("{:<50} {:<20.1f}".format("Average Running Requests:", avg_stats['avg_requests_running']))
         print("{:<50} {:<20.1f}".format("Average Waiting Requests:", avg_stats['avg_requests_waiting']))
+
+        if avg_stats.get("total_page_eviction_ops", 0) > 0 or avg_stats.get(
+            "total_page_eviction_blocks", 0
+        ) > 0:
+            print("\n" + "-" * 70)
+            print("{s:^{n}}".format(s='PageEviction Statistics', n=70))
+            print("-" * 70)
+            print(
+                "{:<50} {:<20,.0f}".format(
+                    "Total Eviction Ops:", avg_stats.get("total_page_eviction_ops", 0)
+                )
+            )
+            print(
+                "{:<50} {:<20,.0f}".format(
+                    "Total Evicted Blocks:",
+                    avg_stats.get("total_page_eviction_blocks", 0),
+                )
+            )
+            print(
+                "{:<50} {:<20.3f}".format(
+                    "Avg Eviction Ops/Sample:",
+                    avg_stats.get("avg_page_eviction_ops_per_sample", 0),
+                )
+            )
+            print(
+                "{:<50} {:<20.3f}".format(
+                    "Avg Evicted Blocks/Sample:",
+                    avg_stats.get("avg_page_eviction_blocks_per_sample", 0),
+                )
+            )
+
+        if avg_stats.get("total_spec_draft_tokens", 0) > 0:
+            print("\n" + "-" * 70)
+            print("{s:^{n}}".format(s='Spec Decode Statistics', n=70))
+            print("-" * 70)
+            print(
+                "{:<50} {:<20,.0f}".format(
+                    "Total Draft Tokens:",
+                    avg_stats.get("total_spec_draft_tokens", 0),
+                )
+            )
+            print(
+                "{:<50} {:<20,.0f}".format(
+                    "Total Accepted Tokens:",
+                    avg_stats.get("total_spec_accepted_tokens", 0),
+                )
+            )
+            print(
+                "{:<50} {:<20.4f}".format(
+                    "Acceptance Rate:",
+                    avg_stats.get("spec_decode_acceptance_rate", 0),
+                )
+            )
         
         if 'cache_usage' in detailed_stats:
             print("\n" + "-" * 70)
@@ -1311,6 +1412,433 @@ async def benchmark(
             "static_config": detailed_stats.get('static_config', {}),
             "monitoring_interval_seconds": kv_cache_monitor.interval,
             "samples_collected": len(kv_trace.get('cache_usage', [])),
+        }
+
+        result["page_eviction_monitoring_stats"] = {
+            "total_eviction_ops": avg_stats.get("total_page_eviction_ops", 0),
+            "total_eviction_ops_prefill": avg_stats.get(
+                "total_page_eviction_ops_prefill", 0
+            ),
+            "total_eviction_ops_decode": avg_stats.get(
+                "total_page_eviction_ops_decode", 0
+            ),
+            "total_evicted_blocks": avg_stats.get("total_page_eviction_blocks", 0),
+            "total_prefill_reqs_scheduled": avg_stats.get(
+                "total_page_eviction_prefill_reqs_scheduled", 0
+            ),
+            "total_prefill_reqs_query_len_gt_budget": avg_stats.get(
+                "total_page_eviction_prefill_reqs_query_len_gt_budget", 0
+            ),
+            "prefill_query_len_gt_budget_ratio": avg_stats.get(
+                "prefill_query_len_gt_budget_ratio", 0
+            ),
+            "total_replace_block_req_ids": avg_stats.get(
+                "total_page_eviction_replace_block_req_ids", 0
+            ),
+            "replace_block_req_ids_count_per_sample_p50": avg_stats.get(
+                "replace_block_req_ids_count_per_sample_p50", 0
+            ),
+            "replace_block_req_ids_count_per_sample_p90": avg_stats.get(
+                "replace_block_req_ids_count_per_sample_p90", 0
+            ),
+            "replace_block_req_ids_count_per_sample_p99": avg_stats.get(
+                "replace_block_req_ids_count_per_sample_p99", 0
+            ),
+            "total_score_collect_calls_single": avg_stats.get(
+                "total_page_eviction_score_collect_calls_single", 0
+            ),
+            "total_score_collect_calls_ubatch_list": avg_stats.get(
+                "total_page_eviction_score_collect_calls_ubatch_list", 0
+            ),
+            "total_score_collect_return_none_ubatch_list": avg_stats.get(
+                "total_page_eviction_score_collect_return_none_ubatch_list", 0
+            ),
+            "score_collect_return_none_ubatch_ratio": avg_stats.get(
+                "score_collect_return_none_ubatch_ratio", 0
+            ),
+            "total_prefill_block_scores_returned": avg_stats.get(
+                "total_page_eviction_prefill_block_scores_returned", 0
+            ),
+            "total_decode_token_scores_returned": avg_stats.get(
+                "total_page_eviction_decode_token_scores_returned", 0
+            ),
+            "total_prefill_compress_invocations": avg_stats.get(
+                "total_page_eviction_prefill_compress_invocations", 0
+            ),
+            "prefill_compress_invocations_per_request_mean": avg_stats.get(
+                "prefill_compress_invocations_per_request_mean", 0
+            ),
+            "total_request_success": avg_stats.get("total_request_success", 0),
+            "prefill_compress_calls_per_request_mean": avg_stats.get(
+                "prefill_compress_calls_per_request_mean", 0
+            ),
+            "prefill_compress_calls_per_request_p99": avg_stats.get(
+                "prefill_compress_calls_per_request_p99", 0
+            ),
+            "prefill_compress_calls_per_request_max": avg_stats.get(
+                "prefill_compress_calls_per_request_max", 0
+            ),
+            "prefill_compress_time_ms_total": avg_stats.get(
+                "prefill_compress_time_ms_total", 0
+            ),
+            "prefill_compress_time_ms_per_event_p50": avg_stats.get(
+                "prefill_compress_time_ms_per_event_p50", 0
+            ),
+            "prefill_compress_time_ms_per_event_p90": avg_stats.get(
+                "prefill_compress_time_ms_per_event_p90", 0
+            ),
+            "prefill_compress_time_ms_per_event_p99": avg_stats.get(
+                "prefill_compress_time_ms_per_event_p99", 0
+            ),
+            "prefill_keep_len_mean": avg_stats.get("prefill_keep_len_mean", 0),
+            "prefill_keep_len_p90": avg_stats.get("prefill_keep_len_p90", 0),
+            "prefill_kept_ratio_mean": avg_stats.get("prefill_kept_ratio_mean", 0),
+            "prefill_kept_ratio_p90": avg_stats.get("prefill_kept_ratio_p90", 0),
+            "decode_eviction_ops_per_request_p50": avg_stats.get(
+                "decode_eviction_ops_per_request_p50", 0
+            ),
+            "decode_eviction_ops_per_request_p90": avg_stats.get(
+                "decode_eviction_ops_per_request_p90", 0
+            ),
+            "decode_eviction_ops_per_request_p99": avg_stats.get(
+                "decode_eviction_ops_per_request_p99", 0
+            ),
+            "decode_evicted_blocks_per_op_p50": avg_stats.get(
+                "decode_evicted_blocks_per_op_p50", 0
+            ),
+            "decode_evicted_blocks_per_op_p90": avg_stats.get(
+                "decode_evicted_blocks_per_op_p90", 0
+            ),
+            "decode_evicted_blocks_per_op_p99": avg_stats.get(
+                "decode_evicted_blocks_per_op_p99", 0
+            ),
+            "decode_eviction_time_ms_per_op_p50": avg_stats.get(
+                "decode_eviction_time_ms_per_op_p50", 0
+            ),
+            "decode_eviction_time_ms_per_op_p90": avg_stats.get(
+                "decode_eviction_time_ms_per_op_p90", 0
+            ),
+            "decode_eviction_time_ms_per_op_p99": avg_stats.get(
+                "decode_eviction_time_ms_per_op_p99", 0
+            ),
+            "decode_pages_scored_per_op_p50": avg_stats.get(
+                "decode_pages_scored_per_op_p50", 0
+            ),
+            "decode_pages_scored_per_op_p90": avg_stats.get(
+                "decode_pages_scored_per_op_p90", 0
+            ),
+            "decode_pages_scored_per_op_p99": avg_stats.get(
+                "decode_pages_scored_per_op_p99", 0
+            ),
+            "active_concurrency_p50": avg_stats.get("active_concurrency_p50", 0),
+            "active_concurrency_p90": avg_stats.get("active_concurrency_p90", 0),
+            "num_prefill_tokens_scheduled_p50": avg_stats.get(
+                "prefill_tokens_scheduled_p50", 0
+            ),
+            "num_prefill_tokens_scheduled_p90": avg_stats.get(
+                "prefill_tokens_scheduled_p90", 0
+            ),
+            "num_prefill_tokens_scheduled_p99": avg_stats.get(
+                "prefill_tokens_scheduled_p99", 0
+            ),
+            "num_decode_tokens_scheduled_p50": avg_stats.get(
+                "decode_tokens_scheduled_p50", 0
+            ),
+            "num_decode_tokens_scheduled_p90": avg_stats.get(
+                "decode_tokens_scheduled_p90", 0
+            ),
+            "num_decode_tokens_scheduled_p99": avg_stats.get(
+                "decode_tokens_scheduled_p99", 0
+            ),
+            "avg_eviction_ops_per_sample": avg_stats.get(
+                "avg_page_eviction_ops_per_sample", 0
+            ),
+            "avg_evicted_blocks_per_sample": avg_stats.get(
+                "avg_page_eviction_blocks_per_sample", 0
+            ),
+            "trace_eviction_ops_delta": kv_trace.get("page_eviction_ops_delta", []),
+            "trace_eviction_ops_prefill_delta": kv_trace.get(
+                "page_eviction_ops_prefill_delta", []
+            ),
+            "trace_eviction_ops_decode_delta": kv_trace.get(
+                "page_eviction_ops_decode_delta", []
+            ),
+            "trace_prefill_reqs_scheduled_delta": kv_trace.get(
+                "page_eviction_prefill_reqs_scheduled_delta", []
+            ),
+            "trace_prefill_reqs_query_len_gt_budget_delta": kv_trace.get(
+                "page_eviction_prefill_reqs_query_len_gt_budget_delta", []
+            ),
+            "trace_replace_block_req_ids_delta": kv_trace.get(
+                "page_eviction_replace_block_req_ids_delta", []
+            ),
+            "trace_score_collect_calls_single_delta": kv_trace.get(
+                "page_eviction_score_collect_calls_single_delta", []
+            ),
+            "trace_score_collect_calls_ubatch_list_delta": kv_trace.get(
+                "page_eviction_score_collect_calls_ubatch_list_delta", []
+            ),
+            "trace_score_collect_return_none_ubatch_list_delta": kv_trace.get(
+                "page_eviction_score_collect_return_none_ubatch_list_delta", []
+            ),
+            "trace_prefill_block_scores_returned_delta": kv_trace.get(
+                "page_eviction_prefill_block_scores_returned_delta", []
+            ),
+            "trace_decode_token_scores_returned_delta": kv_trace.get(
+                "page_eviction_decode_token_scores_returned_delta", []
+            ),
+            "trace_prefill_compress_invocations_delta": kv_trace.get(
+                "page_eviction_prefill_compress_invocations_delta", []
+            ),
+            "trace_evicted_blocks_delta": kv_trace.get(
+                "page_eviction_blocks_delta", []
+            ),
+            "trace_prefill_compress_calls_per_request": kv_trace.get(
+                "prefill_compress_calls_per_request", []
+            ),
+            "trace_active_concurrency": kv_trace.get("active_concurrency", []),
+            "trace_prefill_tokens_scheduled_delta": kv_trace.get(
+                "prompt_tokens_delta", []
+            ),
+            "trace_decode_tokens_scheduled_delta": kv_trace.get(
+                "generation_tokens_delta", []
+            ),
+            "trace_decode_evicted_blocks_per_op": kv_trace.get(
+                "decode_evicted_blocks_per_op", []
+            ),
+            "trace_decode_eviction_time_ms_per_op": kv_trace.get(
+                "decode_eviction_time_ms_per_op", []
+            ),
+            "trace_decode_pages_scored_per_op": kv_trace.get(
+                "decode_pages_scored_per_op", []
+            ),
+            "trace_prefill_compress_time_ms_per_event": kv_trace.get(
+                "prefill_compress_time_ms_per_event", []
+            ),
+            "trace_prefill_keep_len": kv_trace.get("prefill_keep_len", []),
+            "trace_prefill_kept_ratio": kv_trace.get("prefill_kept_ratio", []),
+        }
+
+        result["spec_decode_monitoring_stats"] = {
+            "total_draft_tokens": avg_stats.get("total_spec_draft_tokens", 0),
+            "total_accepted_tokens": avg_stats.get(
+                "total_spec_accepted_tokens", 0
+            ),
+            "acceptance_rate": avg_stats.get("spec_decode_acceptance_rate", 0),
+            "avg_acceptance_rate": avg_stats.get(
+                "avg_spec_decode_acceptance_rate", 0
+            ),
+            "trace_acceptance_rate": kv_trace.get("spec_decode_acceptance_rate", []),
+        }
+
+    def _safe_percentile(values: List[float], p: float) -> Optional[float]:
+        if not values:
+            return None
+        return float(np.percentile(values, p))
+
+    def _weighted_tpot_ms(
+        output_lens: List[int],
+        ttfts: List[float],
+        e2els: List[float],
+        *,
+        min_output_len: int = 2,
+        selected_indices: Optional[List[int]] = None,
+    ) -> Optional[float]:
+        decode_time_sum = 0.0
+        decode_token_count = 0
+        indices = selected_indices if selected_indices is not None else list(
+            range(min(len(output_lens), len(ttfts), len(e2els)))
+        )
+        for idx in indices:
+            if idx >= len(output_lens) or idx >= len(ttfts) or idx >= len(e2els):
+                continue
+            out_len = int(output_lens[idx])
+            if out_len < max(min_output_len, 2):
+                continue
+            decode_time = max(float(e2els[idx]) - float(ttfts[idx]), 0.0)
+            decode_time_sum += decode_time
+            decode_token_count += out_len - 1
+        if decode_token_count <= 0:
+            return None
+        return decode_time_sum / decode_token_count * 1000.0
+
+    output_lens_for_stats = [int(x) for x in result.get("output_lens", [])]
+    input_lens_for_stats = [int(x) for x in result.get("input_lens", [])]
+    ttfts_for_stats = [float(x) for x in result.get("ttfts", [])]
+    e2els_for_stats = [float(x) for x in result.get("e2els", [])]
+    errors_for_stats = result.get("errors", [])
+    finish_reasons_for_stats = result.get("finish_reasons", [])
+    stop_reasons_for_stats = result.get("stop_reasons", [])
+
+    result["output_len_distribution"] = {
+        "mean": (float(np.mean(output_lens_for_stats)) if output_lens_for_stats else None),
+        "p50": _safe_percentile(output_lens_for_stats, 50),
+        "p90": _safe_percentile(output_lens_for_stats, 90),
+        "p99": _safe_percentile(output_lens_for_stats, 99),
+        "ratio_out_len_lt_16": (
+            float(sum(1 for x in output_lens_for_stats if x < 16)) / len(output_lens_for_stats)
+            if output_lens_for_stats
+            else None
+        ),
+        "ratio_out_len_lt_64": (
+            float(sum(1 for x in output_lens_for_stats if x < 64)) / len(output_lens_for_stats)
+            if output_lens_for_stats
+            else None
+        ),
+        "ratio_out_len_lt_200": (
+            float(sum(1 for x in output_lens_for_stats if x < 200))
+            / len(output_lens_for_stats)
+            if output_lens_for_stats
+            else None
+        ),
+    }
+
+    finish_reason_counts = {
+        "eos": 0,
+        "length": 0,
+        "stop": 0,
+        "error": 0,
+        "abort": 0,
+        "unknown": 0,
+    }
+    n_finish = min(
+        len(output_lens_for_stats),
+        len(errors_for_stats),
+        len(finish_reasons_for_stats),
+    )
+    for i in range(n_finish):
+        err = errors_for_stats[i]
+        fr = finish_reasons_for_stats[i]
+        sr = stop_reasons_for_stats[i] if i < len(stop_reasons_for_stats) else None
+        fr_norm = str(fr).lower() if fr is not None else ""
+        sr_norm = str(sr).lower() if sr is not None else ""
+        if err:
+            finish_reason_counts["error"] += 1
+        elif fr_norm == "length":
+            finish_reason_counts["length"] += 1
+        elif fr_norm == "error":
+            finish_reason_counts["error"] += 1
+        elif fr_norm == "abort":
+            finish_reason_counts["abort"] += 1
+        elif fr_norm in ("eos",):
+            finish_reason_counts["eos"] += 1
+        elif "eos" in sr_norm:
+            finish_reason_counts["eos"] += 1
+        elif fr_norm == "stop":
+            finish_reason_counts["stop"] += 1
+        else:
+            finish_reason_counts["unknown"] += 1
+    result["finish_reason_counts"] = finish_reason_counts
+
+    result["weighted_tpot_ms"] = _weighted_tpot_ms(
+        output_lens_for_stats,
+        ttfts_for_stats,
+        e2els_for_stats,
+        min_output_len=2,
+    )
+    result["weighted_tpot_ms_out>=200"] = _weighted_tpot_ms(
+        output_lens_for_stats,
+        ttfts_for_stats,
+        e2els_for_stats,
+        min_output_len=200,
+    )
+
+    kv_budget = None
+    kv_budget_env = os.getenv("KV_CACHE_BUDGET")
+    if kv_budget_env is not None and str(kv_budget_env).strip():
+        try:
+            kv_budget = int(kv_budget_env)
+        except ValueError:
+            kv_budget = None
+
+    if kv_budget is not None and kv_budget > 0:
+        le_budget_indices = [
+            i for i, x in enumerate(input_lens_for_stats) if int(x) <= kv_budget
+        ]
+        gt_budget_indices = [
+            i for i, x in enumerate(input_lens_for_stats) if int(x) > kv_budget
+        ]
+
+        def _bucket_stats(indices: List[int]) -> Dict[str, Optional[float]]:
+            out_vals = [output_lens_for_stats[i] for i in indices if i < len(output_lens_for_stats)]
+            ttft_vals = [
+                ttfts_for_stats[i] * 1000.0
+                for i in indices
+                if i < len(ttfts_for_stats)
+            ]
+            e2e_vals = [
+                e2els_for_stats[i] * 1000.0
+                for i in indices
+                if i < len(e2els_for_stats)
+            ]
+            tpot_vals = []
+            for i in indices:
+                if i >= len(output_lens_for_stats) or i >= len(ttfts_for_stats) or i >= len(e2els_for_stats):
+                    continue
+                out_len = output_lens_for_stats[i]
+                if out_len < 2:
+                    continue
+                tpot_vals.append(
+                    max(e2els_for_stats[i] - ttfts_for_stats[i], 0.0) / (out_len - 1) * 1000.0
+                )
+            return {
+                "num_requests": len(indices),
+                "output_len_p50": _safe_percentile(out_vals, 50),
+                "output_len_p90": _safe_percentile(out_vals, 90),
+                "output_len_p99": _safe_percentile(out_vals, 99),
+                "ttft_ms_p50": _safe_percentile(ttft_vals, 50),
+                "ttft_ms_p90": _safe_percentile(ttft_vals, 90),
+                "ttft_ms_p99": _safe_percentile(ttft_vals, 99),
+                "e2e_ms_p50": _safe_percentile(e2e_vals, 50),
+                "e2e_ms_p90": _safe_percentile(e2e_vals, 90),
+                "e2e_ms_p99": _safe_percentile(e2e_vals, 99),
+                "tpot_ms_p50": _safe_percentile(tpot_vals, 50),
+                "tpot_ms_p90": _safe_percentile(tpot_vals, 90),
+                "tpot_ms_p99": _safe_percentile(tpot_vals, 99),
+                "weighted_tpot_ms": _weighted_tpot_ms(
+                    output_lens_for_stats,
+                    ttfts_for_stats,
+                    e2els_for_stats,
+                    min_output_len=2,
+                    selected_indices=indices,
+                ),
+                "weighted_tpot_ms_out>=200": _weighted_tpot_ms(
+                    output_lens_for_stats,
+                    ttfts_for_stats,
+                    e2els_for_stats,
+                    min_output_len=200,
+                    selected_indices=indices,
+                ),
+            }
+
+        result["prompt_len_bucket_stats"] = {
+            "budget": kv_budget,
+            "prompt_len_le_budget": _bucket_stats(le_budget_indices),
+            "prompt_len_gt_budget": _bucket_stats(gt_budget_indices),
+        }
+
+    if gpu_monitors is not None and result.get("gpu_power_stats"):
+        peak_allocated_mb = 0.0
+        peak_reserved_mb = 0.0
+        per_gpu_peak_allocated_mb = {}
+        for gpu_id, gpu_stats in result["gpu_power_stats"].items():
+            used_trace = gpu_stats.get("memory_used_mb_trace", [])
+            peak_gpu_used_mb = float(max(used_trace)) if used_trace else 0.0
+            per_gpu_peak_allocated_mb[gpu_id] = peak_gpu_used_mb
+            peak_allocated_mb += peak_gpu_used_mb
+            # NVML does not expose torch reserved bytes; use allocated approximation.
+            peak_reserved_mb += peak_gpu_used_mb
+        oom_count = sum(
+            1
+            for err in errors_for_stats
+            if isinstance(err, str) and err and re.search(r"oom|out of memory", err, re.IGNORECASE)
+        )
+        result["memory_stats"] = {
+            "peak_allocated_mb": peak_allocated_mb,
+            "peak_reserved_mb": peak_reserved_mb,
+            "per_gpu_peak_allocated_mb": per_gpu_peak_allocated_mb,
+            "oom_count": oom_count,
+            "engine_restart_count": 0,
         }
 
     def process_one_metric(
@@ -1401,6 +1929,13 @@ async def get_kv_cache_stats(base_url: str, enable_trace: bool = False, sample_c
     }
     
     metrics_url = f"{base_url}/metrics"
+
+    def _sum_counter_values(metrics_text: str, metric_name: str) -> float:
+        pattern = re.compile(
+            rf"^{re.escape(metric_name)}_total(?:\{{[^}}]*\}})?\s+([0-9eE+.\-]+)$",
+            re.MULTILINE,
+        )
+        return float(sum(float(m.group(1)) for m in pattern.finditer(metrics_text)))
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -1449,6 +1984,19 @@ async def get_kv_cache_stats(base_url: str, enable_trace: bool = False, sample_c
                             match = re.search(pattern, metrics_text)
                             if match:
                                 sample_stats[key] = float(match.group(1))
+
+                        sample_stats['page_eviction_ops_total'] = _sum_counter_values(
+                            metrics_text, 'vllm:page_eviction_num_eviction_ops'
+                        )
+                        sample_stats['page_eviction_blocks_total'] = _sum_counter_values(
+                            metrics_text, 'vllm:page_eviction_num_evicted_blocks'
+                        )
+                        sample_stats['spec_decode_draft_tokens_total'] = _sum_counter_values(
+                            metrics_text, 'vllm:spec_decode_num_draft_tokens'
+                        )
+                        sample_stats['spec_decode_accepted_tokens_total'] = _sum_counter_values(
+                            metrics_text, 'vllm:spec_decode_num_accepted_tokens'
+                        )
                         
                         if sample_stats:
                             kv_stats['dynamic_samples'].append(sample_stats)
@@ -1512,6 +2060,44 @@ async def get_kv_cache_stats(base_url: str, enable_trace: bool = False, sample_c
                         'metrics_endpoint': metrics_url,
                         'samples_collected': len(kv_stats['dynamic_samples']),
                     }
+
+                # Counter deltas from first to last sample.
+                if len(samples) >= 2:
+                    ops_delta = max(
+                        0.0,
+                        samples[-1].get('page_eviction_ops_total', 0.0)
+                        - samples[0].get('page_eviction_ops_total', 0.0),
+                    )
+                    blocks_delta = max(
+                        0.0,
+                        samples[-1].get('page_eviction_blocks_total', 0.0)
+                        - samples[0].get('page_eviction_blocks_total', 0.0),
+                    )
+                    spec_draft_delta = max(
+                        0.0,
+                        samples[-1].get('spec_decode_draft_tokens_total', 0.0)
+                        - samples[0].get('spec_decode_draft_tokens_total', 0.0),
+                    )
+                    spec_accepted_delta = max(
+                        0.0,
+                        samples[-1].get('spec_decode_accepted_tokens_total', 0.0)
+                        - samples[0].get('spec_decode_accepted_tokens_total', 0.0),
+                    )
+                else:
+                    ops_delta = 0.0
+                    blocks_delta = 0.0
+                    spec_draft_delta = 0.0
+                    spec_accepted_delta = 0.0
+
+                dynamic_stats['page_eviction_ops_total_delta'] = ops_delta
+                dynamic_stats['page_eviction_blocks_total_delta'] = blocks_delta
+                dynamic_stats['spec_decode_draft_tokens_total_delta'] = spec_draft_delta
+                dynamic_stats['spec_decode_accepted_tokens_total_delta'] = spec_accepted_delta
+                dynamic_stats['spec_decode_acceptance_rate'] = (
+                    (spec_accepted_delta / spec_draft_delta)
+                    if spec_draft_delta > 0
+                    else 0.0
+                )
                     
                 print(f"\n✓ Successfully fetched KV cache statistics from server ({len(samples)} samples)")
             else:
@@ -1568,8 +2154,13 @@ def main(args: argparse.Namespace):
             interval=kv_interval,
             truncate=args.gpu_monitor_truncate
         )
-        print(f"✓ KV Cache Monitor initialized: interval={kv_interval}s (GPU/CPU: {args.gpu_monitor_interval}s)")
-        print(f"  Note: KV cache uses longer interval as metrics update slower than power readings")
+        print(
+            f"✓ KV/PageEviction/Spec Monitor initialized: interval={kv_interval}s "
+            f"(GPU/CPU: {args.gpu_monitor_interval}s)"
+        )
+        print(
+            "  Note: cache/eviction/spec metrics use a longer interval than power readings"
+        )
     else:
         kv_cache_monitor = None
 
@@ -1858,7 +2449,30 @@ def main(args: argparse.Namespace):
                         "free_gpu_blocks_min": detailed.get("used_blocks", {}).get("min", 0),
                         "used_kv_cache_tokens_peak": detailed.get("used_tokens", {}).get("max", 0),
                         # Combined usage percentage
-                        "kv_cache_usage_percentage": avg_stats.get("avg_cache_usage_perc", 0) * 100,
+                        "kv_cache_usage_percentage": avg_stats.get("avg_cache_usage_perc", 0),
+                        # PageEviction counters
+                        "page_eviction_ops_total_delta": avg_stats.get(
+                            "total_page_eviction_ops", 0
+                        ),
+                        "page_eviction_blocks_total_delta": avg_stats.get(
+                            "total_page_eviction_blocks", 0
+                        ),
+                        "page_eviction_ops_avg_per_sample": avg_stats.get(
+                            "avg_page_eviction_ops_per_sample", 0
+                        ),
+                        "page_eviction_blocks_avg_per_sample": avg_stats.get(
+                            "avg_page_eviction_blocks_per_sample", 0
+                        ),
+                        # Spec decode counters
+                        "spec_decode_draft_tokens_total_delta": avg_stats.get(
+                            "total_spec_draft_tokens", 0
+                        ),
+                        "spec_decode_accepted_tokens_total_delta": avg_stats.get(
+                            "total_spec_accepted_tokens", 0
+                        ),
+                        "spec_decode_acceptance_rate": avg_stats.get(
+                            "spec_decode_acceptance_rate", 0
+                        ),
                     },
                     "dynamic_samples": [],
                     "trace_info": {
@@ -1899,6 +2513,28 @@ def main(args: argparse.Namespace):
                         print(f"  Avg Running Requests: {dynamic_stats['num_requests_running_avg']:.1f}")
                     if 'num_requests_running_max' in dynamic_stats:
                         print(f"  Max Running Requests: {int(dynamic_stats['num_requests_running_max'])}")
+                    if dynamic_stats.get("page_eviction_ops_total_delta", 0) > 0:
+                        print(
+                            "  PageEviction Ops: "
+                            f"{dynamic_stats['page_eviction_ops_total_delta']:,.0f}"
+                        )
+                        print(
+                            "  PageEviction Evicted Blocks: "
+                            f"{dynamic_stats['page_eviction_blocks_total_delta']:,.0f}"
+                        )
+                    if dynamic_stats.get("spec_decode_draft_tokens_total_delta", 0) > 0:
+                        print(
+                            "  Spec Draft Tokens: "
+                            f"{dynamic_stats['spec_decode_draft_tokens_total_delta']:,.0f}"
+                        )
+                        print(
+                            "  Spec Accepted Tokens: "
+                            f"{dynamic_stats['spec_decode_accepted_tokens_total_delta']:,.0f}"
+                        )
+                        print(
+                            "  Spec Acceptance Rate: "
+                            f"{dynamic_stats['spec_decode_acceptance_rate']:.4f}"
+                        )
 
                 print("=" * 50)
             else:
